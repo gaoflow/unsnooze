@@ -523,6 +523,15 @@ export async function dispatchOne(rec, {
 // (argv or typed) — not on ready-timeouts or a still-active limit banner.
 async function reopen(rec, { mux, resolveMux, agent, resumeMessage, selfCmd, onDelivered = () => {} }) {
   const key = rec.key;
+  // Local patch #4: anonymous pane-snapshot records (no sessionId) cannot be
+  // deduplicated against each other, so at a mass reset each one revives its
+  // own copy of the same conversation (2026-07-27: ~8 parallel clones of one
+  // session). Only records that know their sessionId may reopen a dead pane.
+  if (!rec.sessionId) {
+    setStatus(key, 'failed', { lastError: 'anonymous record (no sessionId) — reopen disabled by local patch', verifyRetries: 0 });
+    log(`${key}: reopen skipped — no sessionId (anonymous scrape record)`);
+    return 'skipped';
+  }
   const resume = agent.resumeArgs(rec.sessionId, resumeMessage);
   const leaseId = createLeaseId();
   const target = await reviveTarget(mux, rec);
