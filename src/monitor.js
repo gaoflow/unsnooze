@@ -85,13 +85,22 @@ export function createMonitor({
     };
   }
 
-  function computeReset(resetLine, bannerAt, detectedAt) {
-    return resetAtMs(parseResetTime(resetLine), {
+  function computeReset(resetLine, bannerAt, detectedAt, limitType) {
+    let { at, source } = resetAtMs(parseResetTime(resetLine), {
       marginMs: RESET_MARGIN_MS,
       fallbackMs: PROBE_INTERVAL_MS,
       now: new Date(detectedAt),
       bannerAt,
     });
+    // A 5h rolling window can never reset more than ~5h out. A parse far
+    // beyond that means the banner text is stale — e.g. scraped from pane
+    // history after midnight, where an undated clock time resolves to
+    // tomorrow. The announced reset already passed; wake now instead.
+    if (limitType === '5h' && source === 'absolute'
+      && at > detectedAt + 5.5 * 3_600_000) {
+      at = detectedAt + RESET_MARGIN_MS;
+    }
+    return { at, source };
   }
 
   // §6 first-tick corroboration: only record if a fresh transcript backs it,
@@ -132,7 +141,7 @@ export function createMonitor({
   async function recordLimit(resetLine, limitType, via) {
     const resolved = resolveBanner(resetLine, limitType);
     const detectedVia = resolved.via || via;
-    const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt);
+    const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt, resolved.limitType);
     let muxSession = null;
     if (typeof mux.sessionForPane === 'function') {
       try { muxSession = await mux.sessionForPane(pane); } catch { muxSession = null; }
@@ -275,7 +284,7 @@ export function createMonitor({
       if (existing && existing.status === 'stopped') {
         const resolved = resolveBanner(d.resetLine, d.limitType);
         const via = resolved.via || (marker ? 'hook' : 'scrape');
-        const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt);
+        const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt, resolved.limitType);
         maybeUpgrade(existing, at, source, resolved.bannerAt, resolved.limitType, via);
         firstTick = false;
         return;
@@ -287,7 +296,7 @@ export function createMonitor({
         if (firstTick) {
           const resolved = resolveBanner(d.resetLine, d.limitType);
           const detectedVia = resolved.via || via;
-          const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt);
+          const { at, source } = computeReset(resolved.resetLine, resolved.bannerAt, resolved.detectedAt, resolved.limitType);
           if (!isCorroborated({ ...resolved, via: detectedVia }, at, source)) {
             log(`pane ${pane}: first tick banner uncorroborated (${source}) — skipping`);
             firstTick = false;
@@ -324,9 +333,22 @@ export function createMonitor({
       const state = readState();
       const rec = state.sessions[trackedKey];
       if (rec && rec.status === 'stopped') {
-        setStatus(trackedKey, 'resumed', { lastAttemptAt: Date.now(), bannerCleared: true });
-        log(`pane ${pane}: banner cleared, ${trackedKey} marked resumed`);
-        trackedKey = null;
+        if ((rec.attempts || 0) === 0 && !isBusy(text, agent.patterns.busyPatterns)) {
+          // Banner gone, nothing ever typed a wake, and the pane sits at an
+          // idle prompt: the agent's own UI cleared the banner when the reset
+          // passed. That is not a resume — make the record due now so the
+          // resumer still delivers the wake message.
+          updateState(state => {
+            const s = state.sessions[trackedKey];
+            if (s && s.status === 'stopped' && (s.attempts || 0) === 0) s.resetAt = Date.now();
+          });
+          log(`pane ${pane}: banner cleared but pane idle with no resume attempt — ${trackedKey} marked due now`);
+          spawnResumerIfNeeded();
+        } else {
+          setStatus(trackedKey, 'resumed', { lastAttemptAt: Date.now(), bannerCleared: true });
+          log(`pane ${pane}: banner cleared, ${trackedKey} marked resumed`);
+          trackedKey = null;
+        }
       }
       if (rec && rec.status === 'resumed') {
         setStatus(trackedKey, 'resumed', { bannerCleared: true });
